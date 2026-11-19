@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no" />
+  <title>Rampanau — Joystick AR</title>
+  <style>
+    html, body { margin:0; height:100%; overflow:hidden; background:#152223; font-family:system-ui,Arial,sans-serif; }
+    #kivicubeScene { position:absolute; inset:0; width:100%; height:100%; border:0; }
+    #status { position:absolute; z-index:10; left:50%; top:max(12px,env(safe-area-inset-top)); transform:translateX(-50%);
+              max-width:85%; padding:9px 13px; border-radius:15px; background:#172324cf; color:white;
+              font-size:12px; text-align:center; pointer-events:none; }
+    #controls { position:absolute; z-index:5; pointer-events:none; left:0; right:0;
+                bottom:max(22px,env(safe-area-inset-bottom)); display:flex;
+                justify-content:space-between; align-items:flex-end; padding:0 26px; }
+    #stick { touch-action:none; position:relative; height:100px; width:100px; border-radius:50%;
+             box-sizing:border-box; border:2px solid #f7e6b3a6; background:#17191c99;
+             box-shadow:0 4px 20px #0006; pointer-events:auto; user-select:none; }
+    #thumb { position:absolute; left:50%; top:50%; height:50px; width:50px; border-radius:50%;
+             background:linear-gradient(145deg,#f6e3a4,#c7923d); border:3px solid #fff8;
+             box-shadow:0 3px 12px #0007; transform:translate(-50%,-50%); pointer-events:none; }
+    #twirl { pointer-events:auto; border:2px solid #ffe7a7; border-radius:50%; height:100px; width:100px;
+             background:#9a3423dc; color:white; font-weight:800; font-size:15px; letter-spacing:.4px;
+             box-shadow:0 4px 16px #0007; touch-action:manipulation; }
+    #twirl:active { transform:scale(.95); }
+    #note { position:absolute; bottom:8px; left:0; right:0; color:#fff9;
+            text-align:center; font-size:11px; pointer-events:none; }
+  </style>
+</head>
+<body>
+  <!-- The Playground replaces this placeholder using the Scene ID at the top of its editor. -->
+  <iframe
+  id="kivicubeScene"
+  scene-id="bgn18m3RNSjk1CVOgh2aHoIdPDNQ5Vyl">
+</iframe>
+
+  <div id="status" role="status">Open your scene and scan the Rampanau card</div>
+  <div id="controls">
+    <div id="stick" aria-label="Drag to move Rampanau character" role="group">
+      <div id="thumb"></div>
+    </div>
+    <button id="twirl" type="button">TWIRL ↻</button>
+  </div>
+  <div id="note">Drag joystick to walk • Release to balance</div>
+
+  <script src="https://www.kivicube.com/lib/iframe-plugin.js"></script>
+  <script>
+    // ===== CHANGE THESE SETTINGS IF NEEDED =====
+    const MODEL_NAME = 'Rampanau_Player'; // Best: rename the model in Kivicube to this.
+    const WALK = 'Rampanau_Walk_Loop';
+    const IDLE = 'Balance_Idle';
+    const TWIRL = 'Rampanau_Twirl_360';
+    const MOVE_SPEED = 0.25;       // Scene units per second. Increase for faster walking.
+    const MAX_DISTANCE = 1.25;     // Max radius from starting position. Keeps boy near target.
+    const FORWARD_OFFSET = 0;     // Set to Math.PI if model faces backwards.
+    // =========================================
+
+    const iframe = document.getElementById('kivicubeScene');
+    const stick = document.getElementById('stick');
+    const thumb = document.getElementById('thumb');
+    const twirlBtn = document.getElementById('twirl');
+    const statusEl = document.getElementById('status');
+    const axis = { x:0, y:0 };      // y=-1 = joystick pushed up
+    let api = null, model = null, home = null, initialRotation = null;
+    let preparing = false, spinning = false, spinCount = 0;
+    let currentClip = '', wantedClip = IDLE, switching = false;
+    let hasTwirl = false, busy = false, previousTick = performance.now();
+
+    function status(message) { statusEl.textContent = message; console.log('[Rampanau]', message); }
+    function isWalking() { return Math.hypot(axis.x, axis.y) > .08; }
+    function requestClip(name) { wantedClip = name; void updateClip(); }
+
+    async function updateClip() {
+      if (!model || !api || switching) return;
+      switching = true;
+      try {
+        while (wantedClip !== currentClip) {
+          const next = wantedClip;
+          if (currentClip) await api.stopAnimation(model, currentClip);
+          await api.playAnimation(model, {
+            name: next,
+            loop: next !== TWIRL,
+            repeat: next === TWIRL ? 1 : Infinity
+          });
+          currentClip = next;
+        }
+      } catch (error) {
+        console.error('[Rampanau] Animation error', error);
+        status('Animation error: check your model clip names');
+      } finally { switching = false; }
+    }
+
+    async function findRampanauModel() {
+      // Exact name is the most reliable solution.
+      let target = await api.getObject(MODEL_NAME);
+      if (target) return target;
+      // Fallback for objects not yet renamed in the Kivicube editor.
+      const all = await api.getAllObjects();
+      for (const obj of all) {
+        const name = String((await api.getObjectName(obj)) || '');
+        if (/rampanau|stilts|stilt|kid/i.test(name)) {
+          const clips = await api.getAnimationNames(obj).catch(() => null);
+          if (Array.isArray(clips) && clips.includes(WALK)) return obj;
+        }
+      }
+      for (const obj of all) {
+        const clips = await api.getAnimationNames(obj).catch(() => null);
+        if (Array.isArray(clips) && clips.includes(WALK)) return obj;
+      }
+      console.log('[Rampanau] Scene objects found:', await Promise.all(all.map(o => api.getObjectName(o))));
+      return null;
+    }
+
+    async function prepareScene() {
+      if (!api || preparing || model) return;
+      preparing = true;
+      try {
+        const candidate = await findRampanauModel();
+        if (!candidate) { status('Character not found. Rename its scene object Rampanau_Player.'); return; }
+        const clips = await api.getAnimationNames(candidate);
+        if (!clips || !clips.includes(WALK) || !clips.includes(IDLE)) {
+          status('Wrong GLB: need Rampanau_Walk_Loop and Balance_Idle'); return;
+        }
+        model = candidate;
+        home = await api.getPosition(model);
+        initialRotation = await api.getRotation(model);
+        hasTwirl = clips.includes(TWIRL);
+        twirlBtn.disabled = !hasTwirl;
+        twirlBtn.style.opacity = hasTwirl ? '1' : '.45';
+        await api.on('ended', event => {
+          if (event.animationName === TWIRL) finishSpin();
+        }, model);
+        requestClip(IDLE);
+        status(hasTwirl ? 'Ready! Joystick = walk • TWIRL = spin' : 'Ready! Joystick = walk (twirl clip missing)');
+      } catch (err) {
+        console.error('[Rampanau] Initialization error:', err);
+        status('Scene not ready, or its object API is unavailable.');
+      } finally { preparing = false; }
+    }
+
+    // API becomes available in the iframe's `ready` event.
+    iframe.addEventListener('ready', event => {
+      api = event.detail.api;
+      void prepareScene();
+    });
+    // Retry after assets are loaded if `ready` fires early.
+    iframe.addEventListener('loadSceneEnd', () => void prepareScene());
+    iframe.addEventListener('sceneStart', () => void prepareScene());
+
+    function applyPointer(event) {
+      const rect = stick.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
+      const radius = rect.width * .33;
+      let x = (event.clientX - cx) / radius;
+      let y = (event.clientY - cy) / radius;
+      const length = Math.max(1, Math.hypot(x,y));
+      x /= length; y /= length;
+      axis.x = x; axis.y = y;
+      thumb.style.transform = `translate(-50%,-50%) translate(${x*radius}px,${y*radius}px)`;
+      if (!spinning && model) requestClip(isWalking() ? WALK : IDLE);
+    }
+    let activePointer = null;
+    stick.addEventListener('pointerdown', event => {
+      if (activePointer !== null) return;
+      activePointer = event.pointerId;
+      stick.setPointerCapture(event.pointerId);
+      applyPointer(event);
+    });
+    stick.addEventListener('pointermove', event => {
+      if (event.pointerId === activePointer) applyPointer(event);
+    });
+    function releasePointer(event) {
+      if (event.pointerId !== activePointer) return;
+      activePointer = null;
+      axis.x = axis.y = 0;
+      thumb.style.transform = 'translate(-50%,-50%)';
+      if (!spinning) requestClip(IDLE);
+    }
+    stick.addEventListener('pointerup', releasePointer);
+    stick.addEventListener('pointercancel', releasePointer);
+    stick.addEventListener('lostpointercapture', releasePointer);
+
+    function finishSpin() {
+      if (!spinning) return;
+      spinning = false;
+      previousTick = performance.now();
+      requestClip(isWalking() ? WALK : IDLE);
+    }
+    twirlBtn.addEventListener('click', () => {
+      if (!model || !hasTwirl || spinning) return;
+      spinning = true;
+      const thisSpin = ++spinCount;
+      requestClip(TWIRL);
+      // The supplied GLB's 360-degree twirl clip lasts 2.8 seconds.
+      // Fallback if the animation's `ended` callback does not fire.
+      setTimeout(() => {
+        if (spinning && thisSpin === spinCount) finishSpin();
+      }, 3200);
+    });
+
+    // Set position/rotation through the asynchronous Kivicube iframe API.
+    // One request at a time avoids piling up transform commands across the iframe boundary.
+    setInterval(async () => {
+      const now = performance.now();
+      const dt = Math.min((now - previousTick) / 1000, .08);
+      previousTick = now;
+      if (busy || spinning || !model || !api || !home || !isWalking()) return;
+      busy = true;
+      try {
+        const len = Math.hypot(axis.x,axis.y);
+        const speed = MOVE_SPEED * Math.min(1,len);
+        const sx = axis.x / len, sz = -axis.y / len;
+        const baseYaw = initialRotation[1] || 0;
+        const c = Math.cos(baseYaw), s = Math.sin(baseYaw);
+        const dx = sx*c + sz*s, dz = -sx*s + sz*c;
+        const old = await api.getPosition(model);
+        let x = old[0] + dx*speed*dt;
+        let z = old[2] + dz*speed*dt;
+        const distance = Math.hypot(x-home[0], z-home[2]);
+        if (distance > MAX_DISTANCE) {
+          const t = MAX_DISTANCE / distance;
+          x = home[0] + (x-home[0])*t;
+          z = home[2] + (z-home[2])*t;
+        }
+        await api.setPosition(model, x, home[1], z);
+        const heading = baseYaw + Math.atan2(sx,sz) + FORWARD_OFFSET;
+        await api.setRotation(model, initialRotation[0], heading, initialRotation[2], initialRotation[3] || 'XYZ');
+      } catch (error) {
+        console.error('[Rampanau] Movement error:',error);
+        status('Movement error — inspect the Playground console');
+      } finally { busy = false; }
+    }, 50);
+  </script>
+</body>
+</html>
